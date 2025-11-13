@@ -1,182 +1,237 @@
-# models/STEP2_train_bot_lstm.py
+# models/STEP2_train_bot_lstm.py (FINAL 3-TIER ASYMMETRIC STRATEGY)
 import pandas as pd
 import numpy as np
+import os
+import sys
+import joblib
 import torch
 import torch.nn as nn
-# ✅ 核心修正: 从 torch.utils.data 中同时导入 Dataset, DataLoader, TensorDataset
-from torch.utils.data import Dataset, DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.neighbors import NearestNeighbors
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import MinMaxScaler
-import os
-import joblib
-from config import UNIFIED_FEATURE_SET, TARGET_FIELDS_FOR_LSTM
 
-# 导入我们在STEP1中定义的CAE模型类
-# 为了方便，直接在这里重新定义
-class ConditionalAE(nn.Module):
-    def __init__(self, input_dim, condition_dim, encoding_dim):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim + condition_dim, 32), nn.ReLU(),
-            nn.Linear(32, 16), nn.ReLU(),
-            nn.Linear(16, encoding_dim)
-        )
-        self.decoder = nn.Sequential(
-            nn.Linear(encoding_dim + condition_dim, 16), nn.ReLU(),
-            nn.Linear(16, 32), nn.ReLU(),
-            nn.Linear(32, input_dim)
-        )
+# ==========================================================
+# --- Path Setup & Imports ---
+# ==========================================================
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.append(project_root)
 
-    def forward(self, x, c):
-        x_cond = torch.cat([x, c], dim=1);
-        encoded = self.encoder(x_cond)
-        encoded_cond = torch.cat([encoded, c], dim=1);
-        decoded = self.decoder(encoded_cond)
-        return decoded, encoded
+# ✅✅✅ 1. 导入最终的三层特征体系 ✅✅✅
+from config import DEFENDER_SET, ATTACKER_KNOWLEDGE_SET, ATTACKER_ACTION_SET, set_seed
+from models.style_transfer_cae import ConditionalAutoencoder
+from models.bot_pattern_lstm import BotPatternLSTM
+from models.mlp_architecture import MLP_Classifier
 
+# ==========================================================
+# --- 1. Configuration ---
+# ==========================================================
+# --- Paths ---
+TRAIN_SET_PATH = os.path.join(project_root, 'data', 'splits', 'training_set.csv')
+SCALER_PATH = os.path.join(project_root, 'models', 'global_scaler.pkl')
+CAE_MODEL_PATH = os.path.join(project_root, 'models', 'style_transfer_cae.pt')
+PROXY_HUNTER_MODEL_PATH = os.path.join(project_root, 'models', 'proxy_hunter_distilled.pt')
+LSTM_MODEL_PATH = os.path.join(project_root, 'models', 'bot_pattern_lstm_final.pt')
 
-# 导入我们在之前定义的LSTM模型类
-class PredictiveLSTM(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim):
-        super().__init__()
-        self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True, num_layers=2, dropout=0.2)
-        self.fc = nn.Sequential(nn.Linear(hidden_dim, 32), nn.ReLU(), nn.Dropout(0.2), nn.Linear(32, output_dim))
+# --- Model Parameters (适配三层体系) ---
+# Proxy hunter sees the widest view
+PROXY_FEATURE_DIM = len(DEFENDER_SET)
+# CAE operates on our knowledge boundary
+CAE_FEATURE_DIM = len(ATTACKER_KNOWLEDGE_SET)
+LATENT_DIM_CAE = 5
+NUM_CLASSES_CAE = 2
+# LSTM operates on our action boundary
+INPUT_DIM_LSTM = LATENT_DIM_CAE
+OUTPUT_DIM_LSTM = len(ATTACKER_ACTION_SET)
+HIDDEN_DIM_LSTM = 64
+COND_DIM_LSTM = NUM_CLASSES_CAE
 
-    def forward(self, x):
-        lstm_out, _ = self.lstm(x);
-        last_time_step_out = lstm_out[:, -1, :];
-        return self.fc(last_time_step_out)
-
-
-# --- 1. 配置区 ---
-DATA_DIR_PREPROCESSED = r'D:\DTCA\data\preprocessed'
-DATA_DIR_FILTERED = r'D:\DTCA\data\filtered'
-MODELS_DIR = r'D:\DTCA\models'
-
-# --- 输入路径 ---
-# STEP1训练好的风格迁移引擎
-cae_model_path = os.path.join(MODELS_DIR, 'style_transfer_cae.pt')
-# LSTM的训练数据源 (已处理的Bot流量)
-bot_processed_path = os.path.join(DATA_DIR_PREPROCESSED, 'bot_traffic_processed.csv')
-# LSTM的目标值来源 (原始的Bot流量)
-raw_bot_csv = os.path.join(DATA_DIR_FILTERED, 'bot_traffic_target.csv')
-
-# --- 输出路径 ---
-lstm_model_path = os.path.join(MODELS_DIR, 'bot_pattern_lstm.pt')
-target_scaler_path = os.path.join(MODELS_DIR, 'target_scaler_bot.pkl')  # Scaler for Y values
-
-# --- 模型参数 ---
-input_dim_cae = len(UNIFIED_FEATURE_SET)
-encoding_dim = 5
-condition_dim = 2
-input_dim_lstm = encoding_dim  # LSTM的输入是CAE的编码维度
-
-window_size = 3
-batch_size = 32
-epochs = 100
-learning_rate = 0.001
-hidden_dim = 64
+# --- Training Parameters ---
+WINDOW_SIZE = 3
+BATCH_SIZE = 128
+EPOCHS = 50
+LEARNING_RATE = 0.0005
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-target_fields = TARGET_FIELDS_FOR_LSTM
+
+# --- 最终解决方案: 双重“紧箍咒” ---
+LAMBDA_ADV = 1.0  # 攻击动机
+LAMBDA_L2 = 0.01  # 扰动大小惩罚
+LABEL_SMOOTHING = 0.9  # 标签平滑
 
 
-# --- 数据集定义 ---
-class SequenceDataset(Dataset):
-    def __init__(self, x, y): self.x = torch.tensor(x, dtype=torch.float32); self.y = torch.tensor(y,
-                                                                                                   dtype=torch.float32)
+# ==========================================================
+# --- 2. Custom Dataset ---
+# ==========================================================
+class AdversarialDataset(torch.utils.data.Dataset):
+    def __init__(self, X_seq, Y_seq_delta, C_seq, source_features_for_proxy):
+        self.X_seq = torch.tensor(X_seq, dtype=torch.float32)
+        self.Y_seq_delta = torch.tensor(Y_seq_delta, dtype=torch.float32)
+        self.C_seq = torch.tensor(C_seq, dtype=torch.float32)
+        # ✅ 2. 数据集现在携带防御者视野的完整特征，专供代理猎手使用
+        self.source_features_for_proxy = torch.tensor(source_features_for_proxy, dtype=torch.float32)
 
-    def __len__(self): return len(self.x)
+    def __len__(self):
+        return len(self.X_seq)
 
-    def __getitem__(self, idx): return self.x[idx], self.y[idx]
+    def __getitem__(self, idx):
+        return (self.X_seq[idx], self.Y_seq_delta[idx], self.C_seq[idx], self.source_features_for_proxy[idx])
 
 
-# --- 主训练函数 ---
+# ==========================================================
+# --- 3. Main Training Function ---
+# ==========================================================
 def main():
-    print("=============================================");
-    print("🚀 STEP 2: 开始训练'动态模式注入'LSTM引擎...");
-    print("=============================================");
+    set_seed(2025)
+    print("=" * 60);
+    print("🚀 对抗训练框架 (最终版 - 三层非对称策略)...");
+    print("=" * 60)
+    print(
+        f"   >>> 防御者视野: {PROXY_FEATURE_DIM}维, 攻击者认知: {CAE_FEATURE_DIM}维, 攻击者行动: {OUTPUT_DIM_LSTM}维 <<<")
+    print(f"   >>> 策略: 扰动学习 + 双重正则化 <<<")
     print(f"使用设备: {device}")
 
-    # 1. 加载STEP1的CAE模型
-    print("正在加载'风格迁移'CAE引擎...")
-    cae_model = ConditionalAE(input_dim_cae, condition_dim, encoding_dim).to(device)
-    cae_model.load_state_dict(torch.load(cae_model_path))
-    cae_model.eval()  # 我们只用它的encoder，所以设为评估模式
+    # --- 1. Load Assets ---
+    try:
+        df_train_full = pd.read_csv(TRAIN_SET_PATH)
+        scaler = joblib.load(SCALER_PATH)
+        # ✅ 3. 初始化模型时使用正确的维度
+        cae_model = ConditionalAutoencoder(CAE_FEATURE_DIM, LATENT_DIM_CAE, NUM_CLASSES_CAE).to(device)
+        cae_model.load_state_dict(torch.load(CAE_MODEL_PATH, map_location=device, weights_only=True))
+        proxy_hunter = MLP_Classifier(PROXY_FEATURE_DIM).to(device)
+        proxy_hunter.load_state_dict(torch.load(PROXY_HUNTER_MODEL_PATH, map_location=device, weights_only=True))
+    except FileNotFoundError as e:
+        print(f"错误: 找不到核心文件 - {e}");
+        return
 
-    # 2. 准备LSTM的输入 (X) 和目标 (Y)
-    print("正在准备LSTM的训练数据...")
-    df_bot_processed = pd.read_csv(bot_processed_path)
-    X_bot_for_encoding = torch.tensor(df_bot_processed.values, dtype=torch.float32).to(device)
+    cae_model.eval();
+    proxy_hunter.eval()
+    for param in cae_model.parameters(): param.requires_grad = False
+    for param in proxy_hunter.parameters(): param.requires_grad = False
 
-    # 创建Bot的条件标签 [0, 1]
-    C_bot_for_encoding = torch.zeros(len(X_bot_for_encoding), condition_dim).to(device)
-    C_bot_for_encoding[:, 1] = 1
+    # --- 2. Data Preparation ---
+    print("\n[步骤1] 正在准备三层非对称训练数据...")
+    df_benign_train = df_train_full[df_train_full['label'] == 0].copy()
+    df_bot_train = df_train_full[df_train_full['label'] == 1].copy()
 
-    # 使用CAE编码器提取Bot的潜在表示，作为LSTM的输入特征
+    # KNN Pairing
+    benign_anchors = df_benign_train[['Flow Duration']].values
+    bot_anchors = df_bot_train[['Flow Duration']].values
+    knn_model = NearestNeighbors(n_neighbors=1).fit(bot_anchors)
+    _, indices = knn_model.kneighbors(benign_anchors)
+    df_bot_paired = df_bot_train.iloc[indices.ravel()].reset_index(drop=True)
+    df_benign_train = df_benign_train.reset_index(drop=True)
+
+    # ✅ 4. 按三层体系准备数据
+    # 先用scaler转换所有防御者能看到的特征
+    X_benign_def_scaled = scaler.transform(df_benign_train[DEFENDER_SET].values)
+    X_bot_paired_def_scaled = scaler.transform(df_bot_paired[DEFENDER_SET].values)
+    X_bot_def_scaled = scaler.transform(df_bot_train[DEFENDER_SET].values)
+
+    df_benign_scaled = pd.DataFrame(X_benign_def_scaled, columns=DEFENDER_SET)
+    df_bot_paired_scaled = pd.DataFrame(X_bot_paired_def_scaled, columns=DEFENDER_SET)
+    df_bot_scaled = pd.DataFrame(X_bot_def_scaled, columns=DEFENDER_SET)
+
+    # Calculate Deltas (只在攻击者行动集上计算)
+    source_action_features = df_benign_scaled[ATTACKER_ACTION_SET].values
+    target_action_features = df_bot_paired_scaled[ATTACKER_ACTION_SET].values
+    Y_delta_transform = target_action_features - source_action_features
+    Y_delta_recon = np.zeros_like(df_bot_scaled[ATTACKER_ACTION_SET].values)
+
+    # Encode to Latent Space (只使用攻击者认知集)
     with torch.no_grad():
-        _, lstm_input_features = cae_model(X_bot_for_encoding, C_bot_for_encoding)
-    lstm_input_features = lstm_input_features.cpu().numpy()
+        X_benign_knowledge_tensor = torch.tensor(df_benign_scaled[ATTACKER_KNOWLEDGE_SET].values,
+                                                 dtype=torch.float32).to(device)
+        benign_labels = torch.zeros(len(X_benign_knowledge_tensor), NUM_CLASSES_CAE, device=device);
+        benign_labels[:, 0] = 1
+        Z_latent_benign = cae_model.encode(X_benign_knowledge_tensor, benign_labels)
 
-    # 准备LSTM的目标值Y
-    df_raw = pd.read_csv(raw_bot_csv);
-    df_raw.columns = df_raw.columns.str.strip()
-    target_values = df_raw[target_fields].values
-    target_scaler = MinMaxScaler();
-    target_values_scaled = target_scaler.fit_transform(target_values)
-    joblib.dump(target_scaler, target_scaler_path);
-    print(f"✅ 目标值(Y)的Bot-Scaler已保存到: {target_scaler_path}")
+        X_bot_knowledge_tensor = torch.tensor(df_bot_scaled[ATTACKER_KNOWLEDGE_SET].values, dtype=torch.float32).to(
+            device)
+        bot_labels = torch.zeros(len(X_bot_knowledge_tensor), NUM_CLASSES_CAE, device=device);
+        bot_labels[:, 1] = 1
+        Z_latent_bot = cae_model.encode(X_bot_knowledge_tensor, bot_labels)
 
-    # 3. 构建滑动窗口序列
-    print("正在构建滑动窗口序列...")
-    X_seq, Y_seq = [], []
-    for i in range(len(lstm_input_features) - window_size):
-        X_seq.append(lstm_input_features[i:i + window_size]);
-        Y_seq.append(target_values_scaled[i + window_size - 1])
-    X_seq, Y_seq = np.array(X_seq), np.array(Y_seq)
-    X_train, X_val, Y_train, Y_val = train_test_split(X_seq, Y_seq, test_size=0.2, random_state=42)
+    # Create Sequences
+    def create_sequences(latent, delta, source_features_for_proxy, window):
+        X_seq, Y_seq, F_seq_proxy = [], [], []
+        if len(latent) < window: return [np.array([])] * 3
+        for i in range(len(latent) - window + 1):
+            X_seq.append(latent[i: i + window])
+            Y_seq.append(delta[i + window - 1])
+            F_seq_proxy.append(source_features_for_proxy[i + window - 1])
+        return np.array(X_seq), np.array(Y_seq), np.array(F_seq_proxy)
 
-    # 4. 训练LSTM
-    train_loader = DataLoader(SequenceDataset(X_train, Y_train), batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(SequenceDataset(X_val, Y_val), batch_size=batch_size)
+    X_seq_t, Y_seq_t, F_proxy_t = create_sequences(Z_latent_benign.cpu().numpy(), Y_delta_transform,
+                                                   X_benign_def_scaled, WINDOW_SIZE)
+    X_seq_r, Y_seq_r, F_proxy_r = create_sequences(Z_latent_bot.cpu().numpy(), Y_delta_recon, X_bot_def_scaled,
+                                                   WINDOW_SIZE)
 
-    output_dim_lstm = len(target_fields)
-    lstm_model = PredictiveLSTM(input_dim_lstm, hidden_dim, output_dim_lstm).to(device)
-    optimizer = torch.optim.Adam(lstm_model.parameters(), lr=learning_rate);
-    criterion = nn.MSELoss()
+    X_seq = np.concatenate([X_seq_t, X_seq_r]);
+    Y_seq = np.concatenate([Y_seq_t, Y_seq_r])
+    F_proxy_seq = np.concatenate([F_proxy_t, F_proxy_r]);
+    C_seq = np.zeros((len(X_seq), NUM_CLASSES_CAE));
+    C_seq[:, 1] = 1
 
-    print("开始训练LSTM模型...")
-    best_val_loss = float('inf')
-    for epoch in range(epochs):
-        lstm_model.train();
-        total_train_loss = 0
-        for x_batch, y_batch in train_loader:
-            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
-            pred = lstm_model(x_batch);
-            loss = criterion(pred, y_batch)
-            optimizer.zero_grad();
-            loss.backward();
-            optimizer.step();
-            total_train_loss += loss.item()
-        avg_train_loss = total_train_loss / len(train_loader)
+    # --- 3. Create DataLoader ---
+    (X_train, X_val, Y_train, Y_val, C_train, C_val,
+     F_proxy_train, F_proxy_val) = train_test_split(
+        X_seq, Y_seq, C_seq, F_proxy_seq, test_size=0.1, random_state=2025)
 
-        lstm_model.eval();
-        total_val_loss = 0
-        with torch.no_grad():
-            for x_val_batch, y_val_batch in val_loader:
-                x_val_batch, y_val_batch = x_val_batch.to(device), y_val_batch.to(device)
-                val_pred = lstm_model(x_val_batch);
-                val_loss = criterion(val_pred, y_val_batch)
-                total_val_loss += val_loss.item()
-        avg_val_loss = total_val_loss / len(val_loader)
+    train_dataset = AdversarialDataset(X_train, Y_train, C_train, F_proxy_train)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    print(f"✅ 数据准备完毕, 训练样本数: {len(train_dataset)}")
 
-        if (epoch + 1) % 10 == 0: print(f"  -> Epoch {epoch + 1:3d}/{epochs}, Val Loss: {avg_val_loss:.6f}")
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss;
-            torch.save(lstm_model.state_dict(), lstm_model_path)
+    # --- 4. Initialize Models and Loss Functions ---
+    lstm_model = BotPatternLSTM(INPUT_DIM_LSTM, HIDDEN_DIM_LSTM, OUTPUT_DIM_LSTM, COND_DIM_LSTM).to(device)
+    optimizer = torch.optim.Adam(lstm_model.parameters(), lr=LEARNING_RATE)
+    criterion_mse = nn.MSELoss()
+    criterion_adv = nn.BCEWithLogitsLoss()
+    action_indices_in_defender_set = [DEFENDER_SET.index(f) for f in ATTACKER_ACTION_SET]
 
-    print("\n--- 训练完成 ---");
-    print(f"表现最好的'动态模式注入'LSTM引擎已保存在: {lstm_model_path}");
-    print(f"(Final Best Val Loss: {best_val_loss:.6f})")
+    # --- 5. Adversarial Training Loop with Regularization ---
+    print("\n[步骤2] 开始对抗训练...")
+    for epoch in range(EPOCHS):
+        lstm_model.train()
+        total_recon_loss, total_adv_loss, total_l2_loss = 0, 0, 0
+
+        for x_batch, y_delta_batch, c_batch, f_proxy_batch in train_loader:
+            x_batch, y_delta_batch, c_batch, f_proxy_batch = (
+                x.to(device) for x in [x_batch, y_delta_batch, c_batch, f_proxy_batch])
+
+            predicted_delta = lstm_model(x_batch, c_batch)
+
+            # ✅ 5. 在防御者视野的完整特征上，精确地应用扰动
+            adversarial_features = f_proxy_batch.clone()
+            adversarial_features[:, action_indices_in_defender_set] += predicted_delta
+            adversarial_features = torch.clamp(adversarial_features, 0, 1)
+
+            # --- Calculate Losses ---
+            loss_recon = criterion_mse(predicted_delta, y_delta_batch)
+
+            adversarial_logits = proxy_hunter(adversarial_features)
+            smooth_target_labels = torch.full_like(adversarial_logits, LABEL_SMOOTHING)
+            loss_adv = criterion_adv(adversarial_logits, smooth_target_labels)
+
+            loss_l2 = torch.mean(torch.pow(predicted_delta, 2))
+
+            total_loss = loss_recon + LAMBDA_ADV * loss_adv + LAMBDA_L2 * loss_l2
+
+            optimizer.zero_grad()
+            total_loss.backward()
+            optimizer.step()
+
+            total_recon_loss += loss_recon.item();
+            total_adv_loss += loss_adv.item();
+            total_l2_loss += loss_l2.item()
+
+        avg_recon = total_recon_loss / len(train_loader)
+        avg_adv = total_adv_loss / len(train_loader)
+        avg_l2 = total_l2_loss / len(train_loader)
+        print(f"  -> Epoch {epoch + 1:2d}/{EPOCHS}, Recon: {avg_recon:.6f}, Adv: {avg_adv:.6f}, L2: {avg_l2:.6f}")
+
+    # --- Save Final Model ---
+    torch.save(lstm_model.state_dict(), LSTM_MODEL_PATH)
+    print(f"\n✅ 最终版'正则化扰动'LSTM引擎已保存在: {LSTM_MODEL_PATH}")
 
 
 if __name__ == "__main__":

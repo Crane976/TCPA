@@ -1,49 +1,67 @@
-# config.py (v4 - Final & Collinearity Fixed)
+# config.py (THE ULTIMATE GROUND-TRUTH VERSION 2 - LOGICALLY PERFECT)
+import torch
+import numpy as np
+import random
+import os
 
-# ==============================================================================
-# --- 统一特征集定义 (唯一真实来源) ---
-# ==============================================================================
+def set_seed(seed_value=2025):
+    # ... (函数内容不变) ...
+    torch.manual_seed(seed_value)
+    torch.cuda.manual_seed(seed_value)
+    torch.cuda.manual_seed_all(seed_value)
+    np.random.seed(seed_value)
+    random.seed(seed_value)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    os.environ['PYTHONHASHSEED'] = str(seed_value)
+    print(f"✅ 全局随机种子已固定为: {seed_value}")
 
-# 1. 定义一个包含所有可能相关特征的原始并集
-_UNIFIED_FEATURE_SET_RAW = sorted(list(set([
-    # 来自旧的 BENIGN_FEATURE_SET
-    'Flow Duration', 'Fwd IAT Total', 'Flow IAT Max', 'Idle Max',
-    'Fwd IAT Std', 'Flow IAT Std', 'Idle Mean', 'Flow IAT Mean', 'Fwd IAT Mean',
-    'Fwd Header Length', 'Total Fwd Packets', 'Subflow Fwd Packets',
-    'act_data_pkt_fwd', 'Idle Min', 'Idle Std',
-    # 来自我们分析出的 BOT_FEATURE_SET
-    'Bwd IAT Total', 'Active Max', 'Active Min', 'Active Std', 'Active Mean',
-    'Bwd IAT Std', 'Bwd IAT Max', 'Bwd IAT Mean'
-])))
+# =================================================================
+# --- 最终的、三层非对称信息特征体系 (逻辑修正版) ---
+# =================================================================
 
-# 2. ✅ 核心修正: 从原始并集中，移除已知的冗余/共线性特征
-# 我们根据之前的分析，'Subflow Fwd Packets' 与 'Total Fwd Packets' 高度共线，移除前者。
-# 另外，我们有两个 'Fwd IAT Max'，这是笔误，我们也清理掉。
-# 确保列表中的特征名是唯一的。
-_temp_set = set(_UNIFIED_FEATURE_SET_RAW)
-_temp_set.discard('Subflow Fwd Packets') # 移除共线性特征
+# ✅ 第一层: 防御者集 (DEFENDER_SET) - 上帝视角 (23维)
+# 一个宽泛、完备的纯时间统计特征集合，代表信息最全的强大对手。
+DEFENDER_SET = sorted([
+    'Flow Duration', 'Flow IAT Mean', 'Flow IAT Std', 'Flow IAT Max', 'Flow IAT Min',
+    'Fwd IAT Total', 'Fwd IAT Mean', 'Fwd IAT Std', 'Fwd IAT Max', 'Fwd IAT Min',
+    'Bwd IAT Total', 'Bwd IAT Mean', 'Bwd IAT Std', 'Bwd IAT Max', 'Bwd IAT Min',
+    'Active Mean', 'Active Std', 'Active Max', 'Active Min',
+    'Idle Mean', 'Idle Std', 'Idle Max', 'Idle Min',
+])
 
-# 最终的、干净的、数学上稳健的统一特征集
-UNIFIED_FEATURE_SET = sorted(list(_temp_set))
-
-# 打印最终结果以供验证
-print(f"Config loaded: Final Unified Feature Set ({len(UNIFIED_FEATURE_SET)} features).")
-
-
-# ==============================================================================
-# --- LSTM 预测目标定义 ---
-# ==============================================================================
-
-TARGET_FIELDS_FOR_LSTM = [
+# ✅ 第二层: 攻击者认知集 (ATTACKER_KNOWLEDGE_SET) - 情报边界 (13维)
+# 防御者视野的一个真子集，代表我们通过情报分析所能掌握的核心特征。
+# 这是CAE的输入空间。我们排除了更难预测的“Min”、“Max”和宏观的“Total”类特征。
+ATTACKER_KNOWLEDGE_SET = sorted([
     'Flow Duration',
-    'Flow IAT Mean',
-    'Fwd IAT Mean',
-    'Bwd IAT Mean',
-    'Active Mean',
-    'Idle Mean'
-]
+    'Flow IAT Mean', 'Flow IAT Std',
+    'Fwd IAT Mean', 'Fwd IAT Std',
+    'Bwd IAT Mean', 'Bwd IAT Std',
+    'Active Mean', 'Active Std',
+    'Idle Mean', 'Idle Std',
+    'Fwd IAT Total', 'Bwd IAT Total', # 保持Total，因为它是宏观行为的关键
+])
 
-# 检查目标特征是否都在统一特征集中
-for f in TARGET_FIELDS_FOR_LSTM:
-    if f not in UNIFIED_FEATURE_SET:
-        print(f"警告: 目标特征 '{f}' 不在统一特征集中！")
+# ✅ 第三层: 攻击者行动集 (ATTACKER_ACTION_SET) - 物理约束 (9维)
+# 攻击者认知集的一个严格真子集，代表我们最有把握在问题空间中安全操控的特征。
+# 这是LSTM的扰动目标。我们只关注最核心的均值和标准差。
+ATTACKER_ACTION_SET = sorted([
+    'Flow Duration',
+    'Flow IAT Mean', 'Flow IAT Std',
+    'Fwd IAT Mean', 'Fwd IAT Std',
+    'Bwd IAT Mean', 'Bwd IAT Std',
+    'Active Mean',
+    'Idle Mean',
+])
+
+
+print("最终三层非对称特征体系 (逻辑修正版) 加载完毕:")
+print(f"  - 防御者视野 (DEFENDER_SET): {len(DEFENDER_SET)} 个特征")
+print(f"  - 攻击者认知 (ATTACKER_KNOWLEDGE_SET): {len(ATTACKER_KNOWLEDGE_SET)} 个特征")
+print(f"  - 攻击者行动 (ATTACKER_ACTION_SET): {len(ATTACKER_ACTION_SET)} 个特征")
+
+# --- 交叉验证，确保逻辑自洽 ---
+assert set(ATTACKER_ACTION_SET).issubset(set(ATTACKER_KNOWLEDGE_SET)), "行动集必须是认知集的子集!"
+assert set(ATTACKER_KNOWLEDGE_SET).issubset(set(DEFENDER_SET)), "认知集必须是防御者集的子集!"
+print("✅ 特征集逻辑自洽性通过验证。")

@@ -1,14 +1,26 @@
-# models/train_xgboost_hunter.py (Final Confirmed Version)
+# models/train_xgboost_hunter.py (Final Corrected Version)
 import pandas as pd
 import numpy as np
 import os
+import sys
 import joblib
 import xgboost as xgb
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GridSearchCV
 from sklearn.metrics import classification_report, confusion_matrix
 import matplotlib.pyplot as plt
 import seaborn as sns
-from config import UNIFIED_FEATURE_SET  # 导入我们唯一的标准
+
+# ==========================================================
+# --- 路径修正与模块导入 ---
+# ==========================================================
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.append(project_root)
+
+
+# ✅ 1. 导入新的特征集
+from config import DEFENDER_SET, set_seed
+
 
 # ==========================================================
 # --- 中文显示配置 ---
@@ -23,83 +35,92 @@ except Exception:
 # ==========================================================
 # --- 1. 配置区 ---
 # ==========================================================
-DATA_DIR = r'D:\DTCA\data\preprocessed'  # 输入输出都在preprocessed
-MODELS_DIR = r'D:\DTCA\models'
-FIGURES_DIR = r'D:\DTCA\figures'
+# ✅ 核心输入: 使用严格分离的数据集
+TRAIN_SET_PATH = os.path.join(project_root, 'data', 'splits', 'training_set.csv')
+TEST_SET_PATH = os.path.join(project_root, 'data', 'splits', 'holdout_test_set.csv')
+SCALER_PATH = os.path.join(project_root, 'models', 'global_scaler.pkl')
 
-benign_processed_path = os.path.join(DATA_DIR, 'benign_traffic_processed.csv')
-bot_processed_path = os.path.join(DATA_DIR, 'bot_traffic_processed.csv')
-
-hunter_model_path = os.path.join(MODELS_DIR, 'xgboost_hunter.pkl')
-test_set_path = os.path.join(DATA_DIR, 'evaluation_test_set.csv')
+# --- 输出 ---
+MODELS_DIR = os.path.join(project_root, 'models')
+FIGURES_DIR = os.path.join(project_root, 'figures')
+HUNTER_MODEL_PATH = os.path.join(MODELS_DIR, 'xgboost_hunter.pkl')
 
 
 # ==========================================================
 # --- 2. 主训练函数 ---
 # ==========================================================
 def main():
-    print("=============================================")
-    print("🚀 开始训练'最强猎手' (XGBoost Classifier)...")
-    print("=============================================")
+    set_seed(2025)  # ✅ 在main函数开头调用
+    print("==========================================================")
+    print("🚀 开始训练'均衡型猎手' (在严格分离的数据集上)...")
+    print("==========================================================")
 
-    print("正在加载和准备数据...")
+    # --- 1. 加载所有资产 ---
+    print("正在加载训练集、留出测试集和全局Scaler...")
     try:
-        df_benign = pd.read_csv(benign_processed_path)
-        df_bot = pd.read_csv(bot_processed_path)
+        df_train = pd.read_csv(TRAIN_SET_PATH)
+        df_test = pd.read_csv(TEST_SET_PATH)
+        scaler = joblib.load(SCALER_PATH)
     except FileNotFoundError as e:
-        print(f"错误: 找不到输入文件 - {e}");
+        print(f"错误: 找不到核心文件 - {e}");
         return
 
-    # ✅ 关键修正：强制所有数据都遵循统一的特征标准
-    # 这可以防止因step2脚本输出列顺序不同等意外情况导致的错误
-    df_benign = df_benign[UNIFIED_FEATURE_SET]
-    df_bot = df_bot[UNIFIED_FEATURE_SET]
+    # --- 2. 准备特征和标签 ---
+    # 从DataFrame中分离特征 (X) 和标签 (y)
+    X_train_raw = df_train[DEFENDER_SET]
+    y_train = df_train['label']
+    X_test_raw = df_test[DEFENDER_SET]
+    y_test = df_test['label']
 
-    df_benign['label'] = 0
-    df_bot['label'] = 1
+    # ✅ 核心操作: 使用加载的Scaler分别转换训练和测试数据
+    print("正在使用Scaler转换数据...")
+    X_train_scaled = scaler.transform(X_train_raw)
+    X_test_scaled = scaler.transform(X_test_raw)
 
-    # 合并前打乱一下，增加随机性
-    df_full = pd.concat([df_benign, df_bot], ignore_index=True).sample(frac=1, random_state=42)
+    print(f"训练集大小: {X_train_scaled.shape}, 测试集大小: {X_test_scaled.shape}")
 
-    X = df_full[UNIFIED_FEATURE_SET]  # 明确使用统一特征集
-    y = df_full['label']
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
+    # --- 3. 使用GridSearchCV寻找最佳超参数 ---
+    print("\n[步骤1] 正在通过GridSearchCV寻找最佳超参数...")
+    hunter_model_base = xgb.XGBClassifier(
+        objective='binary:logistic', eval_metric='logloss', use_label_encoder=False,
+        n_estimators=100, n_jobs=-1, random_state=2025
     )
-    print(f"训练集大小: {X_train.shape}, 测试集大小: {X_test.shape}")
-    print(f"训练集中Bot样本比例: {y_train.mean():.2%}")
-    print(f"测试集中Bot样本比例: {y_test.mean():.2%}")
+    param_grid = {
+        'scale_pos_weight': [5, 10, 15, 20],
+        'max_depth': [5, 6, 7],
+        'learning_rate': [0.05, 0.1]
+    }
+    grid_search = GridSearchCV(estimator=hunter_model_base, param_grid=param_grid, scoring='f1', cv=3, verbose=2)
 
-    df_test = pd.concat([X_test, y_test], axis=1)
-    df_test.to_csv(test_set_path, index=False)
-    print(f"\n✅ 独立的测试集已保存到: {test_set_path}")
+    # ✅ 在正确的、归一化后的训练数据上执行搜索
+    grid_search.fit(X_train_scaled, y_train)
 
-    print("\n正在训练XGBoost模型...")
-    scale_pos_weight = (y_train == 0).sum() / (y_train == 1).sum()
+    print(f"\n搜索完成！ -> 最佳参数组合: {grid_search.best_params_}")
 
+    # --- 4. 使用最佳参数训练最终模型 ---
+    print("\n[步骤2] 正在使用找到的最佳参数训练最终的'猎手'模型...")
+    best_params = grid_search.best_params_
     hunter_model = xgb.XGBClassifier(
         objective='binary:logistic', eval_metric='logloss', use_label_encoder=False,
-        scale_pos_weight=scale_pos_weight, n_estimators=200, max_depth=6,
-        learning_rate=0.1, n_jobs=-1, random_state=42
+        n_estimators=200, n_jobs=-1, random_state=42, **best_params
     )
-    hunter_model.fit(X_train, y_train)
+    hunter_model.fit(X_train_scaled, y_train)
+    joblib.dump(hunter_model, HUNTER_MODEL_PATH)
+    print(f"✅ 最终'猎手'模型已保存到: {HUNTER_MODEL_PATH}")
 
-    joblib.dump(hunter_model, hunter_model_path)
-    print(f"✅ '猎手'模型已保存到: {hunter_model_path}")
-
-    print("\n--- '猎手'在独立测试集上的基线性能报告 ---")
-    y_pred = hunter_model.predict(X_test)
-    print(classification_report(y_test, y_pred, target_names=['Benign', 'Bot']))
+    # --- 5. 在从未见过的留出测试集上进行最终评估 ---
+    print("\n--- '猎手'在【留出测试集】上的真实性能报告 ---")
+    y_pred = hunter_model.predict(X_test_scaled)
+    print(classification_report(y_test, y_pred, target_names=['Benign (0)', 'Bot (1)'], digits=4))
 
     cm = confusion_matrix(y_test, y_pred)
     plt.figure(figsize=(6, 5))
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=['Benign', 'Bot'], yticklabels=['Benign', 'Bot'])
-    plt.title("'猎手'模型在独立测试集上的混淆矩阵")
+    plt.title("'猎手'模型在留出测试集上的混淆矩阵")
     plt.xlabel('预测标签');
     plt.ylabel('真实标签')
     plt.tight_layout()
-    cm_path = os.path.join(FIGURES_DIR, "hunter_baseline_confusion_matrix.png")
+    cm_path = os.path.join(FIGURES_DIR, "hunter_holdout_test_confusion_matrix.png")
     plt.savefig(cm_path, dpi=300)
     print(f"✅ 混淆矩阵已保存到: {cm_path}")
     plt.show()
