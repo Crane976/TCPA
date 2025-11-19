@@ -28,7 +28,6 @@ class ResidualBlock(nn.Module):
 
         return out
 
-
 class MLP_Classifier(nn.Module):
     """一个基于残差块的、更深、更强大的MLP分类器"""
 
@@ -74,3 +73,25 @@ class MLP_Classifier(nn.Module):
         # 用于最终预测的便捷方法
         logits = self.forward(x)
         return torch.sigmoid(logits)
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss的实现，专为解决极端类别不平衡问题。
+    """
+    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha  # alpha用于平衡正负样本的重要性，可以设为 (1-Bot样本比例)
+        self.gamma = gamma  # gamma用于关注难分类样本
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+        pt = torch.exp(-BCE_loss)  # pt是模型对正确类别的预测概率
+        F_loss = self.alpha * (1 - pt)**self.gamma * BCE_loss
+
+        if self.reduction == 'mean':
+            return torch.mean(F_loss)
+        elif self.reduction == 'sum':
+            return torch.sum(F_loss)
+        else:
+            return F_loss
