@@ -1,4 +1,4 @@
-# models/wgan_gp.py
+## models/wgan_gp.py
 import torch
 import torch.nn as nn
 import torch.autograd as autograd
