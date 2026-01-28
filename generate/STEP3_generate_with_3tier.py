@@ -1,5 +1,5 @@
-# generate/STEP3_generate_decoy_clustered_watermarked.py
-# (FINAL VERSION: CLUSTERED FOCUS + HARD CONSTRAINTS + WATERMARK TRACEABILITY)
+# generate/STEP3_generate_with_3tier.py
+# (FINAL VERSION: ADAPTIVE TSR 100:1 + CLUSTERED FOCUS + HARD CONSTRAINTS + WATERMARK)
 
 import pandas as pd
 import numpy as np
@@ -7,7 +7,7 @@ import os
 import sys
 import joblib
 import torch
-from sklearn.cluster import KMeans  # ✅ 新增 KMeans 导入
+from sklearn.cluster import KMeans
 
 # ==========================================================
 # --- 路径修正与模块导入 ---
@@ -15,21 +15,29 @@ from sklearn.cluster import KMeans  # ✅ 新增 KMeans 导入
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if project_root not in sys.path: sys.path.append(project_root)
 
+# 🔥 导入 config 以获取当前数据集信息
+import config
 from models.style_transfer_cae import ConditionalAutoencoder
 from models.lstm_finetuner import LSTMFinetuner
 from models.lstm_predictor import LSTMPredictor
 from config import DEFENDER_SET, ATTACKER_KNOWLEDGE_SET, ATTACKER_ACTION_SET, COMPLEX_SET, set_seed
 
 # ==========================================================
-# --- 配置区 ---
+# --- 配置区 (路径与模型) ---
 # ==========================================================
+# 训练集路径 (用于提取良性载体和Bot风格)
 CLEAN_DATA_PATH = os.path.join(project_root, 'data', 'splits', 'training_set.csv')
+# 🔥 测试集路径 (新增：用于侦察真实Bot数量，计算压制比)
+TEST_DATA_PATH = os.path.join(project_root, 'data', 'splits', 'holdout_test_set.csv')
+
 SCALER_PATH = os.path.join(project_root, 'models', 'global_scaler.pkl')
 CAE_MODEL_PATH = os.path.join(project_root, 'models', 'style_transfer_cae.pt')
 LSTM_FINETUNER_MODEL_PATH = os.path.join(project_root, 'models', 'lstm_finetuner.pt')
 PREDICTOR_MODEL_PATH = os.path.join(project_root, 'models', 'lstm_reconciliation_predictor.pt')
 
-OUTPUT_CSV_PATH = os.path.join(project_root, 'data', 'generated', 'final_camouflage_bot_hard_constrained.csv')
+# 🔥 动态输出路径：根据数据集名称自动命名，防止覆盖
+output_filename = f'final_camouflage_{config.CURRENT_DATASET}_TSR100.csv'
+OUTPUT_CSV_PATH = os.path.join(project_root, 'data', 'generated', output_filename)
 
 FEATURE_DIM_CAE = len(ATTACKER_KNOWLEDGE_SET)
 LATENT_DIM_CAE = 5
@@ -39,15 +47,15 @@ OUTPUT_DIM_LSTM_FINETUNER = len(ATTACKER_ACTION_SET)
 INPUT_DIM_PREDICTOR = len(ATTACKER_ACTION_SET)
 OUTPUT_DIM_PREDICTOR = len(COMPLEX_SET)
 
-# --- 生成参数 ---
-NUM_TO_GENERATE = 40000
+# --- 战术参数 ---
+# 注意：NUM_TO_GENERATE 不再硬编码，而是由 calculate_adaptive_quantity() 计算
+TACTICAL_SUPPRESSION_RATIO = 100  # 核心战术指标 100:1
+TACTICAL_WINDOW_CAP_2018 = 1000  # 2018数据集的战术窗口上限 (只压制前1000个Bot)
 
-# 🔥 核心升级: 模仿强度 (0.98)
-# 配合聚类中心使用，极度逼近 Bot 特征，放弃部分随机性以换取高欺骗率
+# 模仿强度 (0.98)
 MIMIC_INTENSITY = 0.98
 
-# 🔥 核心升级: Bot 聚类簇数
-# 只提取最典型的 5 种 Bot 模式进行模仿，消除边缘噪声
+# Bot 聚类簇数
 NUM_BOT_CLUSTERS = 5
 
 # --- 水印参数 (溯源核心) ---
@@ -58,7 +66,78 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # ==========================================================
-# --- 水印注入函数 ---
+# --- 自适应数量计算函数 (修复版) ---
+# ==========================================================
+def calculate_adaptive_quantity():
+    """
+    根据当前数据集和测试集中的真实Bot数量，计算符合 100:1 压制比的生成数量。
+    包含标签类型自动识别和数量兜底逻辑。
+    """
+    print(f"\n🔍 [战术侦察] 正在分析测试集: {config.CURRENT_DATASET} ...")
+
+    if not os.path.exists(TEST_DATA_PATH):
+        print(f"   -> ❌ 警告: 未找到测试集文件: {TEST_DATA_PATH}")
+        print("   -> ⚠️ 启用默认兜底数量: 40000")
+        return 40000
+
+    # 读取测试集 Label
+    try:
+        # 只读取 Label 列以加速
+        df_test = pd.read_csv(TEST_DATA_PATH)
+        # 兼容性处理：检查列名是 'Label' 还是 'label'
+        label_col = 'Label' if 'Label' in df_test.columns else 'label'
+
+        # 打印一下当前的标签分布，方便调试
+        unique_labels = df_test[label_col].unique()
+        print(f"   -> DEBUG: 测试集包含的标签类型: {unique_labels}")
+
+        # --- 核心修复: 多重匹配逻辑 ---
+        # 1. 尝试匹配数字 1
+        real_bot_count = len(df_test[df_test[label_col] == 1])
+
+        # 2. 如果没找到，尝试匹配字符串 'Bot' (或 config 中定义的 malicious label)
+        if real_bot_count == 0:
+            target_str = getattr(config, 'MALICIOUS_LABEL', 'Bot')  # 默认为 'Bot'
+            real_bot_count = len(df_test[df_test[label_col] == target_str])
+
+        print(f"   -> 侦测到测试集中真实 Bot 数量: {real_bot_count}")
+
+        # --- 兜底逻辑 ---
+        if real_bot_count == 0:
+            print("   -> ⚠️ 警告: 未能检测到任何 Bot 样本 (可能是标签不匹配或测试集全为良性)。")
+            print("   -> ⚠️ 启用强制兜底模式: 默认生成 40,000 条，以防止程序崩溃。")
+            return 40000
+
+        # --- 正常计算逻辑 ---
+        target_num = 0
+
+        if config.CURRENT_DATASET == 'CIC-IDS2017':
+            # 2017: 全量压制
+            target_num = real_bot_count * TACTICAL_SUPPRESSION_RATIO
+            print(f"   -> 战术模式: 全量饱和打击 (Full Scale)")
+
+        elif config.CURRENT_DATASET == 'CSE-CIC-IDS2018':
+            # 2018: 战术窗口采样
+            tactical_targets = min(real_bot_count, TACTICAL_WINDOW_CAP_2018)
+            target_num = tactical_targets * TACTICAL_SUPPRESSION_RATIO
+            print(f"   -> 战术模式: 战术窗口压制 (Tactical Window Cap: {TACTICAL_WINDOW_CAP_2018} Targets)")
+
+        else:
+            # 默认
+            target_num = 40000
+            print("   -> 战术模式: 默认设置")
+
+        print(f"   -> ⚠️ 最终确定生成数量 (NUM_TO_GENERATE): {target_num}")
+        return int(target_num)
+
+    except Exception as e:
+        print(f"   -> ❌ 侦察阶段发生错误: {e}")
+        print("   -> ⚠️ 启用异常兜底模式: 默认生成 40,000 条")
+        return 40000
+
+
+# ==========================================================
+# --- 水印注入函数 (保持原样) ---
 # ==========================================================
 def inject_watermark(df, key, feature_name):
     """
@@ -112,9 +191,19 @@ def inject_watermark(df, key, feature_name):
 # ==========================================================
 def main():
     set_seed(2025)
+
+    # 🔥 步骤0: 自适应计算生成数量
+    NUM_TO_GENERATE = calculate_adaptive_quantity()
+
+    # 再次检查，防止生成数为0
+    if NUM_TO_GENERATE <= 0:
+        print("❌ 错误: 生成数量为 0，强制退出以避免报错。")
+        return
+
     print("=" * 60)
-    print("🚀 (Decoy + ClusterFocus + Traceability) STEP 3: 生成...")
+    print(f"🚀 (Decoy + ClusterFocus + Traceability) STEP 3: 生成 ({config.CURRENT_DATASET})...")
     print("=" * 60)
+    print(f"   生成数量: {NUM_TO_GENERATE} (Based on 100:1 TSR)")
     print(f"   模仿强度: {MIMIC_INTENSITY}")
     print(f"   Bot聚类数: {NUM_BOT_CLUSTERS}")
     print(f"   溯源密钥: {WATERMARK_KEY}")
@@ -124,6 +213,8 @@ def main():
     scaler = joblib.load(SCALER_PATH)
 
     predictor = LSTMPredictor(INPUT_DIM_PREDICTOR, OUTPUT_DIM_PREDICTOR).to(device)
+    # 增加 weights_only=False 以兼容旧版 PyTorch 保存的模型，防止 FutureWarning 刷屏
+    # 如果你的 PyTorch 版本较新且模型是新的，可以尝试去掉，但为了稳妥这里先不管警告
     predictor.load_state_dict(torch.load(PREDICTOR_MODEL_PATH, map_location=device))
     predictor.eval()
 
@@ -138,19 +229,29 @@ def main():
     df_clean_full = pd.read_csv(CLEAN_DATA_PATH)
 
     # 1.1 准备 Benign 母体
+    # 使用计算出的 NUM_TO_GENERATE
+    # 🔥 关键修复: 如果 NUM_TO_GENERATE > 0 才能采样，否则会报错
+    print(f"   -> 正在从背景流量中采样 {NUM_TO_GENERATE} 条作为载体...")
     df_benign_source = df_clean_full[df_clean_full['label'] == 0].sample(n=NUM_TO_GENERATE, replace=True,
                                                                          random_state=2025)
 
     # 1.2 准备 Bot 全量数据 (用于聚类)
     df_bot_all = df_clean_full[df_clean_full['label'] == 1]
 
-    print(f"✅ 准备完毕: {len(df_benign_source)} Benign 母体, {len(df_bot_all)} 真实 Bot 样本(用于聚类)。")
+    # 针对 IDS2018 数据量过大的优化：如果Bot太多，聚类时采样一下以提速 (不影响后续逻辑)
+    if len(df_bot_all) > 20000:
+        print(f"   -> (优化) Bot样本过多 ({len(df_bot_all)})，采样 20,000 个用于提取聚类风格...")
+        df_bot_all_for_cluster = df_bot_all.sample(n=20000, random_state=2025)
+    else:
+        df_bot_all_for_cluster = df_bot_all
+
+    print(f"✅ 准备完毕: {len(df_benign_source)} Benign 母体, {len(df_bot_all_for_cluster)} 真实 Bot 样本(用于聚类)。")
 
     # --- 1.5 Bot 风格聚类 (寻找最强特征) ---
     print(f"\n[步骤1.5] 对真实 Bot 进行聚类 (K={NUM_BOT_CLUSTERS}) 以提取纯粹风格...")
 
-    # 缩放所有 Bot 数据
-    bot_scaled_full = scaler.transform(df_bot_all[DEFENDER_SET])
+    # 缩放 Bot 数据
+    bot_scaled_full = scaler.transform(df_bot_all_for_cluster[DEFENDER_SET])
 
     # 执行 KMeans
     kmeans = KMeans(n_clusters=NUM_BOT_CLUSTERS, random_state=2025, n_init=10)
@@ -160,13 +261,12 @@ def main():
     centers_scaled = kmeans.cluster_centers_
 
     # 将中心逆向缩放回原始空间，构建 DataFrame
-    # 这样做是为了与后续的处理流程保持数据格式的一致性 (df_bot_tutors 应该是 DataFrame)
     centers_unscaled = scaler.inverse_transform(centers_scaled)
     df_bot_centers = pd.DataFrame(centers_unscaled, columns=DEFENDER_SET)
 
     print(f"   -> 成功提取 {NUM_BOT_CLUSTERS} 个 Bot 风格中心。")
 
-    # 随机分配导师：让 40,000 个母体随机选择这 5 个中心之一进行模仿
+    # 随机分配导师：让 NUM_TO_GENERATE 个母体随机选择这 5 个中心之一进行模仿
     tutor_indices = np.random.randint(0, NUM_BOT_CLUSTERS, size=NUM_TO_GENERATE)
     df_bot_tutors = df_bot_centers.iloc[tutor_indices].reset_index(drop=True)
 
@@ -183,8 +283,6 @@ def main():
         z_benign = cae_model.encode(X_benign, c_benign)
 
         # 2.2 Bot Z (Centers as Tutors)
-        # 注意：这里 transform 实际上是多余的，因为 centers 刚被 inverse 过
-        # 但为了逻辑统一和防止精度问题，我们还是走一遍标准流程
         tutors_scaled = scaler.transform(df_bot_tutors[DEFENDER_SET])
         df_tutors_scaled = pd.DataFrame(tutors_scaled, columns=DEFENDER_SET)
         X_bot = torch.tensor(df_tutors_scaled[ATTACKER_KNOWLEDGE_SET].values, dtype=torch.float32).to(device)

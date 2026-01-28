@@ -4,8 +4,158 @@ import torch
 import numpy as np
 import random
 import os
+import sys
 from sklearn.preprocessing import MinMaxScaler  # ✅ 新增导入
 
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path: sys.path.append(project_root)
+
+# =================================================================
+# --- 🌍 全局数据集配置开关 (Global Dataset Switch) ---
+# =================================================================
+CURRENT_DATASET = 'CSE-CIC-IDS2018'
+
+# =================================================================
+# --- 📁 路径配置 (Path Configuration) ---
+# =================================================================
+# 1. 获取当前文件(config.py)所在的目录，即项目根目录 D:\DTCA
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+# 2. 基础数据目录 D:\DTCA\data
+BASE_DATA_DIR = os.path.join(PROJECT_ROOT, 'data')
+
+# 3. 模型保存目录 D:\DTCA\models
+MODEL_SAVE_DIR = os.path.join(PROJECT_ROOT, 'models')
+
+# 4. Scaler 路径 D:\DTCA\models\global_scaler.pkl
+SCALER_PATH = os.path.join(MODEL_SAVE_DIR, 'global_scaler.pkl')
+
+# 5. 数据集切分目录 (存放 training_set.csv 和 holdout_test_set.csv)
+SPLITS_DIR = os.path.join(BASE_DATA_DIR, 'splits')
+
+# --- 根据数据集选择子目录 ---
+if CURRENT_DATASET == 'CIC-IDS2017':
+    RAW_CSV_NAME = 'Friday-WorkingHours-Morning.pcap_ISCX.csv'
+    MALICIOUS_LABEL = 'Bot'
+    OUTPUT_SUBDIR = 'cic_ids_2017'
+
+elif CURRENT_DATASET == 'CSE-CIC-IDS2018':
+    RAW_CSV_NAME = 'Friday-02-03-2018_TrafficForML_CICFlowMeter.csv'
+    MALICIOUS_LABEL = 'Bot'
+    OUTPUT_SUBDIR = 'cse_cic_ids_2018'
+else:
+    raise ValueError(f"未知的数据集: {CURRENT_DATASET}")
+
+# --- 自动生成完整路径 ---
+RAW_DATA_PATH = os.path.join(BASE_DATA_DIR, RAW_CSV_NAME)
+PROCESSED_DIR = os.path.join(BASE_DATA_DIR, OUTPUT_SUBDIR, 'filtered')
+
+# 打印调试信息，确保路径正确
+print(f"🔄 当前工作数据集: {CURRENT_DATASET}")
+print(f"📂 原始文件路径: {RAW_DATA_PATH}")
+print(f"📂 输出目录: {PROCESSED_DIR}")
+print(f"📂 项目根目录: {PROJECT_ROOT}")
+print(f"📂 模型目录: {MODEL_SAVE_DIR}")
+print(f"📂 Scaler路径: {SCALER_PATH}")
+print(f"🎯 目标恶意标签: {MALICIOUS_LABEL}")
+
+# config.py 中的 COLUMN_MAPPING 部分
+
+if CURRENT_DATASET == 'CIC-IDS2017':
+    COLUMN_MAPPING = {}
+
+elif CURRENT_DATASET == 'CSE-CIC-IDS2018':
+    RAW_CSV_NAME = 'Friday-02-03-2018_TrafficForML_CICFlowMeter.csv'
+    MALICIOUS_LABEL = 'Bot'
+    OUTPUT_SUBDIR = 'cse_cic_ids_2018'
+
+    # 🔥 [完整版] 特征列名映射: 2018 (缩写) -> 2017 (全称/代码标准)
+    # 基于你提供的原始CSV列名对比生成
+    COLUMN_MAPPING = {
+        # --- 目标端口 & 基础信息 ---
+        'Dst Port': 'Destination Port',
+        # 'Protocol': 'Protocol', # 2017列表中未提供，保留原名即可，反正DEFENDER_SET不用
+        # 'Timestamp': 'Timestamp', # 同上
+
+        # --- 包数量与长度 (CRITICAL) ---
+        'Tot Fwd Pkts': 'Total Fwd Packets',
+        'Tot Bwd Pkts': 'Total Backward Packets',
+        'TotLen Fwd Pkts': 'Total Length of Fwd Packets',
+        'TotLen Bwd Pkts': 'Total Length of Bwd Packets',
+
+        # --- 包长统计 (CRITICAL) ---
+        'Fwd Pkt Len Max': 'Fwd Packet Length Max',
+        'Fwd Pkt Len Min': 'Fwd Packet Length Min',
+        'Fwd Pkt Len Mean': 'Fwd Packet Length Mean',
+        'Fwd Pkt Len Std': 'Fwd Packet Length Std',
+        'Bwd Pkt Len Max': 'Bwd Packet Length Max',
+        'Bwd Pkt Len Min': 'Bwd Packet Length Min',
+        'Bwd Pkt Len Mean': 'Bwd Packet Length Mean',
+        'Bwd Pkt Len Std': 'Bwd Packet Length Std',
+
+        # --- 流速率 (CRITICAL) ---
+        'Flow Byts/s': 'Flow Bytes/s',  # 注意 2018 拼写是 Byts
+        'Flow Pkts/s': 'Flow Packets/s',
+
+        # --- 流时间间隔 IAT (CRITICAL) ---
+        # Flow IAT Mean/Std/Max/Min 名字一样，不用映射
+        'Fwd IAT Tot': 'Fwd IAT Total',
+        # Fwd IAT Mean/Std/Max/Min 名字一样
+        'Bwd IAT Tot': 'Bwd IAT Total',
+        # Bwd IAT Mean/Std/Max/Min 名字一样
+
+        # --- 标志位 Flags ---
+        'Fwd PSH Flags': 'Fwd PSH Flags',  # 一样
+        'Bwd PSH Flags': 'Bwd PSH Flags',  # 一样
+        'Fwd URG Flags': 'Fwd URG Flags',  # 一样
+        'Bwd URG Flags': 'Bwd URG Flags',  # 一样
+        'FIN Flag Cnt': 'FIN Flag Count',
+        'SYN Flag Cnt': 'SYN Flag Count',
+        'RST Flag Cnt': 'RST Flag Count',
+        'PSH Flag Cnt': 'PSH Flag Count',
+        'ACK Flag Cnt': 'ACK Flag Count',
+        'URG Flag Cnt': 'URG Flag Count',
+        'ECE Flag Cnt': 'ECE Flag Count',
+        # CWE Flag Count 名字一样
+
+        # --- 头部长度 ---
+        'Fwd Header Len': 'Fwd Header Length',
+        'Bwd Header Len': 'Bwd Header Length',
+
+        # --- 速率与包长综合 ---
+        'Fwd Pkts/s': 'Fwd Packets/s',
+        'Bwd Pkts/s': 'Bwd Packets/s',
+        'Pkt Len Min': 'Min Packet Length',  # 注意词序变化
+        'Pkt Len Max': 'Max Packet Length',  # 注意词序变化
+        'Pkt Len Mean': 'Packet Length Mean',
+        'Pkt Len Std': 'Packet Length Std',
+        'Pkt Len Var': 'Packet Length Variance',
+        'Pkt Size Avg': 'Average Packet Size',  # 注意词序变化
+
+        # --- 片段与子流 ---
+        'Fwd Seg Size Avg': 'Avg Fwd Segment Size',  # 注意词序变化
+        'Bwd Seg Size Avg': 'Avg Bwd Segment Size',  # 注意词序变化
+        'Fwd Byts/b Avg': 'Fwd Avg Bytes/Bulk',
+        'Fwd Pkts/b Avg': 'Fwd Avg Packets/Bulk',
+        'Fwd Blk Rate Avg': 'Fwd Avg Bulk Rate',
+        'Bwd Byts/b Avg': 'Bwd Avg Bytes/Bulk',
+        'Bwd Pkts/b Avg': 'Bwd Avg Packets/Bulk',
+        'Bwd Blk Rate Avg': 'Bwd Avg Bulk Rate',
+        'Subflow Fwd Pkts': 'Subflow Fwd Packets',
+        'Subflow Fwd Byts': 'Subflow Fwd Bytes',
+        'Subflow Bwd Pkts': 'Subflow Bwd Packets',
+        'Subflow Bwd Byts': 'Subflow Bwd Bytes',
+
+        # --- 窗口与其它杂项 ---
+        'Init Fwd Win Byts': 'Init_Win_bytes_forward',  # 2017用下划线，2018用缩写
+        'Init Bwd Win Byts': 'Init_Win_bytes_backward',
+        'Fwd Act Data Pkts': 'act_data_pkt_fwd',
+        'Fwd Seg Size Min': 'min_seg_size_forward',
+
+        # --- Active / Idle (名字完全一样，不需要映射) ---
+        # Active Mean, Std, Max, Min
+        # Idle Mean, Std, Max, Min
+    }
 
 def set_seed(seed_value=2025):
     torch.manual_seed(seed_value)

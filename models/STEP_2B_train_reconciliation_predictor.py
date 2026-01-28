@@ -26,7 +26,7 @@ INPUT_DIM = len(ATTACKER_ACTION_SET)
 OUTPUT_DIM = len(COMPLEX_SET)
 
 # --- 训练参数 ---
-EPOCHS = 500
+EPOCHS = 300
 BATCH_SIZE = 64
 LEARNING_RATE = 0.001
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
